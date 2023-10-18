@@ -1,0 +1,9 @@
+{
+  "name": "partyworks-example",
+  "main": "src/index.ts",
+  "port": 1999,
+  "serve": {
+    "path": "public",
+    "build": "src/client.ts"
+  }
+}
