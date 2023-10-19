@@ -3,7 +3,7 @@ import { SingleEventSource } from "./EventSource";
 import PartySocket from "partysocket";
 
 const authTimeout = 10000;
-const socketConnectTimeout = 10000;
+const socketConnectTimeout = 3000;
 const heartbeatInterval = 3000;
 const connectionBackoff = [250, 500, 1000, 5000];
 const authBackoff = [250, 500, 1000, 5000];
@@ -64,29 +64,11 @@ function generateUUID(): string {
 //* status & messages
 //* manual reconnect
 //* manual close
-
 //* handling error events & backoffs
 
-//* [todo] Adding a protocol for diconnecting, and custom errors
-//* [todo] adding proper protcol for everything including auth
-//* [todo] move the socketListeners to top level and removing them
-//* [todo] adding proper cleanups
-//* [todo] adding statuses & pausing/resuming eventsources
-//* [todo] same as above make sure eventSource LISTENERS DON'T GET MESSAGE before open resolved
-//* [todo] adding failed states
-//* [todo] also add/remove listeners for navigator online/offline &  window focus
-//* [todo] also add/remove internal signals for close and error (check what the error  code is all about in websocket error & see if it's a possibility)
-//* [todo] plan on adding this back to partyworks :)
-
-//* [todo] adding teardown properly, see liveblocks when the y remove what message
-//* [TODO] MAKE PING A SEPARATE FUNCITON THAT TAKES BACK TO Conneciton, and onConnection should be a timeout not interval.this will allow for easily moving between when we want to ping on our end
 //* [todo] add a proper reset on diconnection & proper connections & counter states
-//* [todo] goes with the first one, adding proper function handlers for events
-//* [todo] add event listerners and remove them, for Window focus, navigator offline/online
 //* [todo] check to see if pausing messages is even necessary, or maybe adding 2 separate quques, still pausing would be required or maybe configurable evem
-//* [todo] add connection status & failed state as well
-//*
-
+//* [todo] add usuable status for stateBlock, or do we let the end users determine them :/
 //custom error class, that users can use to indicate stop retry, from auth & connectionResolver
 class StopRetry extends Error {
   constructor(msg: string) {
@@ -107,6 +89,28 @@ interface ConnOptions {
   ) => void;
 }
 
+type ConnState =
+  | "initial"
+  | "auth"
+  | "authError"
+  | "connection"
+  | "connectionError"
+  | "connected"
+  | "failed";
+
+//i wonder if cell status is even necessary, i don't see using them or notifying bout them :/
+//block statuses are only one that're meaningful and necessary
+//cell status hmm...
+
+//pickup add proper logging options
+//.start() starting is there only
+//.close() and failed statuses also add
+//then add easy configs
+//lastly go to the world with a separate clients, ask sunil what should be done
+//2 options one is it can be a separate package, other one it being internal only,
+//if separate then addEventListeners are needed,
+//else they don't needed
+
 export class Conn {
   status: "stared" | "not_started" = "not_started";
   stateBlock:
@@ -120,12 +124,18 @@ export class Conn {
   socket: WebSocket | null = null;
   connRetry: number = 0;
   authRetry: number = 0;
-  eventHub: { messages: SingleEventSource<MessageEvent<any>> };
+  eventHub: {
+    messages: SingleEventSource<MessageEvent<any>>;
+    status: SingleEventSource<ConnState>; //will update the status of the machine, maybe reqires a helper to get useful states
+  };
   counter = 0;
+
+  //?do we create a message buffer, before resolving the connection, if we give that config option pauseMessageBeforeConnect or something
 
   constructor(private options: ConnOptions) {
     this.eventHub = {
       messages: new SingleEventSource<MessageEvent<any>>(),
+      status: new SingleEventSource<ConnState>(),
     };
 
     if (!options.userId) {
@@ -133,8 +143,25 @@ export class Conn {
     }
   }
 
+  //these socket event listeners are safe tbh, why?
+  //cuz sockets are almost always closed first before trying an reconn
+  //saying this in context of them emitting for an old socket, and affecting the new one
   onSocketError = (event: Event) => {
     console.log(`[Socket internal error]`, event);
+
+    if (this.socket?.readyState === 1) return;
+
+    // this.counter++;
+    // this.authentication();
+    //now this remains safe
+    //since the counter++ events also change the stateBlock
+    //honestly we can let ping/pong decide it, but the accuracy drops to the heartbeat interval
+    // we try reconnect, on our side, if it's anything other than connected we don't do anything
+    if (this.stateBlock === "connected") {
+      this.closeSocket();
+      this.counter++;
+      this.authentication();
+    }
   };
 
   onSocketClose = (event: CloseEvent) => {
@@ -168,7 +195,32 @@ export class Conn {
     //our signal to stop retry
     if (event.code === 4000) {
       this.counter++;
-      this.stateBlock = "failed";
+      this.stateBlock = "initial";
+      return;
+    }
+
+    // we try reconnect, on our side, if it's anything other than connected we don't do anything
+    if (this.stateBlock === "connected") {
+      this.closeSocket();
+      this.counter++;
+      this.authentication();
+    }
+  };
+
+  onSocketMessage = (event: MessageEvent<any>) => {
+    this.eventHub.messages.notify(event);
+  };
+
+  tryHeartbeat = () => {
+    if (this.stateBlock === "connected") {
+      console.log(`[Manual Heartbeat] offline or focus`);
+
+      //this will lead to 2 pings temporarily
+      //the counter is being guarded by the status, so maybe after some proper fuzz testing we may be able to find bugs,
+      //i feel like a race condition can trigger here, maybe n  ot, just the feeling in strong
+
+      //single use ping
+      this.ping(this.counter, this.socket!, true);
     }
   };
 
@@ -202,14 +254,13 @@ export class Conn {
       url += `?_pk=${userId}`;
     }
 
-    console.log(`[Connection Url] ${url}`);
-
     return url;
   }
 
   //block
   async authentication() {
     this.stateBlock = "auth";
+    this.eventHub.status.notify(this.stateBlock);
     const localCounter = this.counter;
     console.log(`[Authenticating...]`);
     if (typeof this.options.auth === "function") {
@@ -237,9 +288,14 @@ export class Conn {
   //cell
   async authError(counter: number, error: any) {
     this.stateBlock = "authError";
+    this.eventHub.status.notify(this.stateBlock);
 
     if (error instanceof StopRetry) {
       console.log(`[Auth Fail] Server said stop retry`);
+      //we consider it fail
+
+      this.stateBlock = "failed";
+      this.eventHub.status.notify(this.stateBlock);
       return;
     }
 
@@ -268,13 +324,14 @@ export class Conn {
   //block
   async connection(counter: number, params: any) {
     this.stateBlock = "connection";
-    this.authRetry = 0;
+    this.eventHub.status.notify(this.stateBlock);
+    this.authRetry = 0; //reaching here autoresets the auth , well not the best place i guess ><
 
     try {
       let conn = await this._connectSocket(
         this.buildUrl({
           host: params?.host || this.options.host,
-          room: params?.room || this.options.room,
+          room: params?.room || this.options.host,
           userId: this.options.userId!,
           party: this.options.party,
           data: params?.data,
@@ -318,7 +375,6 @@ export class Conn {
         "Bad Config, no connectionResolver provided when waitForRoom was to true"
       );
     let con: WebSocket | null = null;
-    let messageListenerRef: (v: any) => void;
     let connectionResolverRef: (v: any) => void;
     let cleanupRejectRef: (v: any) => void;
 
@@ -326,11 +382,6 @@ export class Conn {
       const conn = new WebSocket(url);
 
       con = conn;
-
-      const messageListener = (e: MessageEvent<any>) => {
-        this.eventHub.messages.notify(e);
-      };
-      messageListenerRef = messageListener;
 
       const connectionResolver = (e: MessageEvent<any>) => {
         if (typeof this.options.connectionResolver === "function") {
@@ -346,7 +397,7 @@ export class Conn {
 
       const cleanupReject = (e: any) => {
         // console.log(`[]er `, e); // not useful, can't get any code out of it
-        conn.removeEventListener("message", messageListener);
+        conn.removeEventListener("message", this.onSocketMessage);
         reject(conn);
       };
 
@@ -368,8 +419,7 @@ export class Conn {
       )
         conn.addEventListener("message", connectionResolver);
 
-      conn.addEventListener("message", messageListener);
-
+      conn.addEventListener("message", this.onSocketMessage);
       conn.addEventListener("close", this.onSocketClose);
       conn.addEventListener("error", this.onSocketError);
     });
@@ -392,7 +442,10 @@ export class Conn {
           "message",
           connectionResolverRef!
         );
-        (con as WebSocket)?.removeEventListener("message", messageListenerRef!);
+        (con as WebSocket)?.removeEventListener(
+          "message",
+          this.onSocketMessage
+        );
 
         (con as WebSocket)?.close();
       }
@@ -403,14 +456,19 @@ export class Conn {
   //cell
   connectionError(counter: number, error: any) {
     this.stateBlock = "connectionError";
+    this.eventHub.status.notify(this.stateBlock);
 
     if (error instanceof StopRetry) {
       console.log(`[Stop Retry] Connection Failed`);
+      this.stateBlock = "failed";
+      this.eventHub.status.notify(this.stateBlock);
       return;
     }
 
     if (this.connRetry >= maxConnTries) {
       console.log(`[Max Conn Tries] moving to -> Connection Failed`);
+      this.stateBlock = "failed";
+      this.eventHub.status.notify(this.stateBlock);
       return;
     }
 
@@ -430,11 +488,13 @@ export class Conn {
     this.connRetry++;
   }
 
-  //cell
-  async connected(counter: number, conn: WebSocket) {
+  //Block
+  async connected(counter: number, conn: WebSocket, fromPong?: boolean) {
     this.stateBlock = "connected";
-    this.connRetry = 0;
-    const interval = setInterval(() => {
+    this.eventHub.status.notify(this.stateBlock);
+    if (!fromPong) this.connRetry = 0; //if this is not rebound from ping, that means a new socket just arrived, fresh & healthy, ok i need to stop writing weird comments
+
+    setTimeout(() => {
       //* ok here what's the scenario ?
       //* let's say a reconnect happened
       //* the normal assumption would be that the socket is closed
@@ -444,43 +504,57 @@ export class Conn {
 
       if (counter !== this.counter) {
         console.log(`[stale] [CONNECTED PING]`);
-        clearInterval(interval);
-
         return;
       }
-
-      console.log(`[CONNECTED PING]`);
-      conn.send("PING");
-
-      const timeout = setTimeout(() => {
-        if (counter !== this.counter) {
-          console.log(`[stale] [PONG TIMEOUT]`);
-          clearInterval(interval);
-          return;
-        }
-        console.log(`[PONG TIMEOUT] moving to -> authentication block`);
-        //cleanup socket
-        clearInterval(interval);
-        this.removeConnection(conn);
-        this.authentication();
-      }, 2000);
-
-      const unsub = this.eventHub.messages.subscribe((e) => {
-        if (e.data === "PONG") {
-          console.log(`[CONNECTED PONG]`);
-          clearTimeout(timeout);
-          unsub();
-        }
-      });
+      this.ping(counter, conn);
     }, heartbeatInterval);
   }
 
   //cell
-  async ping(counter: number, conn: WebSocket) {}
+  //ok lol :< we still need the counter, making this somewhat useless
+  //maybe a good thing adding locks to fsm
+  //a scenario where we pass this.counter & this.socket ain't possible
+  //counter ++ reconnect
+  //ping with stale socket & incorrect counter
+  //ok maybe we make sure to ping onlt when the state is connected?
+  async ping(counter: number, conn: WebSocket, singleUse?: boolean) {
+    console.log(`[CONNECTED PING]`);
+    conn.send("PING");
+
+    const timeout = setTimeout(() => {
+      unsub();
+      if (counter !== this.counter) {
+        console.log(`[stale] [PONG TIMEOUT]`);
+        return;
+      }
+      console.log(`[PONG TIMEOUT] moving to -> authentication block`);
+      //cleanup socket
+      this.removeConnection(conn);
+      this.authentication();
+    }, 2000);
+
+    const unsub = this.eventHub.messages.subscribe((e) => {
+      if (e.data === "PONG") {
+        console.log(
+          counter === this.counter
+            ? `[CONNECTED PONG]`
+            : `[stale] [Connected Pong]`
+        );
+        clearTimeout(timeout);
+        unsub();
+
+        //still safe counter
+        if (counter === this.counter && !singleUse) {
+          this.connected(counter, conn, true);
+        }
+      }
+    });
+  }
 
   //helper
-  removeConnection(socket: WebSocket) {
+  removeConnection(socket?: WebSocket) {
     if (socket) {
+      socket.removeEventListener("message", this.onSocketMessage);
       socket.removeEventListener("close", this.onSocketClose);
       socket.removeEventListener("error", this.onSocketError);
       socket.close();
@@ -491,10 +565,14 @@ export class Conn {
   closeSocket() {
     if (this.socket) {
       console.log(`[Con closed]`);
+      this.socket.removeEventListener("message", this.onSocketMessage);
       this.socket.removeEventListener("close", this.onSocketClose);
       this.socket.removeEventListener("error", this.onSocketError);
       this.socket.close();
       this.socket = null;
+
+      this.stateBlock = "initial"; //todo maybe add closed :/
+      this.eventHub.status.notify(this.stateBlock);
     }
   }
 
@@ -504,8 +582,15 @@ export class Conn {
       return;
     }
 
+    //todo maybe reset all states here, or at in the stop
+
     this.status = "stared";
     this.authentication();
+
+    window.addEventListener("offline", this.tryHeartbeat);
+    window.addEventListener("focus", this.tryHeartbeat);
+
+    //? should we try reconnect online, maybe in certain statuses, huh dunno :/
   }
 
   //only stop if you want to stop the conn
@@ -513,9 +598,12 @@ export class Conn {
   stop() {
     if (this.status === "stared") {
       this.status = "not_started";
-
       this.counter++;
       this.closeSocket();
+      this.eventHub.status.notify(this.stateBlock);
+
+      window.removeEventListener("offline", this.tryHeartbeat);
+      window.removeEventListener("focus", this.tryHeartbeat);
       //whatever pos it's in, we can easily just increase the counter,
       //and the counter guards will take care of stopping themselves
       //we just need to close if any existing con is there
@@ -526,88 +614,6 @@ export class Conn {
     }
   }
 
-  //so thinking of a case where we are manually guarding
-  //let's say connection only updates properly, but during that period there is a reconnect
-  //and now we're guarding on the stateBlock, it's all fine
-  //but assuming that the block comes to the same status when the first socket is accepted
-  //aauu shit we have 2 connections
-  //so we need to have exit functions that make it stale in a manner
-  //but how do exit functions know what to cleanup ?
-  //the cleanup then should be how?
-  //this is the only case that's a race condition, and can happen
-  //we need to prepare for it, the only way to make it stale somehow
-  //but maybe for now let's ignore that particular case
-  //the problem is that it can happen to all listeners
-
-  //* ok got a solution for the above, i.e. having counters, everytime an event like that happens the counter is updated,
-  //* we only look at the counter locally if it still matches then we win else we lose and do a cleanup
-
-  //* rethink the scenario for simple explaination
-  //* machine starts [counter 0]
-  //* authenticating [counter 0]
-  //* reconnect happens [counter 1]
-  //* goes back to authenticating [counter 1]
-  //* auth resolves [counter 0] counters don;t match oops stale event, do a cleanup/exit/ignore
-
-  //* rethink the scenario 2
-  //* machine starts [counter 0]
-  //* authenticating [counter 0]
-  //* authError [counter 0], a timeout is set to move to auth
-  //* reconnect happens [counter 1]
-  //* goes back to authenticating [counter 1]
-  //* timeout executes [counter 0] oops counters don't match, do a cleanup
-
-  //* ok the below scenario obv tells us to use the counter during auth only
-  //* and pass the counter between calls, not very cool, but can be refactored
-
-  //* shit scenario
-  //* machine starts [counter 0]
-  //* authenticating [counter 0]
-  //* reconnect happens [counter 1]
-  //* authError [counter 1], a timeout is set to move to auth
-  //* goes back to authenticating [counter 1]
-  //* connection [counter 1] //conn from reconnect
-  //* connection [counter 1] //conn from authError timeout
-
-  //* rethink the scenario 3
-  //* machine starts [counter 0]
-  //* authenticating [counter 0]
-  //* authError [counter 0], a timeout is set to move to auth
-  //* timeout executes [counter 0] back to authentication
-  //* reconnect happens but same state, so it's ignored || //* reconnect happens but same state, so redo with counter
-
-  //* rethink the scenario 4
-  //* machine starts [counter 0]
-  //* authenticating [counter 0]
-  //* connection [counter 0]
-  //* reconnect happens [counter 1]
-  //* connection success [counter 0] but oops counter don't match, so fail & cleanup
-
-  //* So the cases where we're in the correct place, ex
-  //* connRetry moves back to auth
-  //* reconnect happens
-  //* since it's the same place, we leave it be? or do we redo it again? both are possible with the current setup it'll just work
-
-  //* now a case where we're happily connected
-  //* reconnect happens
-  //* umm, hmm... we exited the connection, so based on our state we nead to run exitConnection cleanup funciton ithink
-
-  //so we basically need these as gatekeepers as well for state transitiong, and the internal machine only should be responsible for the transition
-  //and these will talk to the machine?
-  //let's say conn is timedout & rejected, but later the conn actually get connected it may cause a race condition
-
-  async idle() {}
-  async enterAuth() {}
-  //authentication
-  //authError
-  async exitAuth() {}
-  async enterConnection() {}
-  //connection
-  //connectionError
-  async exitConnection() {}
-  enterConnected() {}
-  //connected
-  //connectedError
   async exitConnected() {
     console.log(`[Exit Conn]`);
     this.socket?.close();
@@ -621,7 +627,7 @@ export class Conn {
     }
 
     if (this.stateBlock === "connected") {
-      this.exitConnected();
+      this.closeSocket();
     }
     this.counter++;
     this.authentication();
@@ -634,12 +640,16 @@ export class Conn {
     }
 
     if (this.stateBlock === "connected") {
-      this.exitConnected();
+      this.closeSocket();
     }
 
+    this.stateBlock = "initial";
+    this.eventHub.status.notify(this.stateBlock);
     this.counter++;
   }
 }
+
+//
 
 const happyAuth = () => {
   return {
@@ -685,9 +695,7 @@ const con = new Conn({
   host: "localhost:1999",
   room: "bb",
   auth: happyAuthPromise,
-  waitForRoom: false,
-
-  //use to wait for a prticular message, waitForRoom should be true
+  waitForRoom: true,
   connectionResolver: function connectionResolver(
     e: MessageEvent<any>,
     resolver
@@ -697,7 +705,6 @@ const con = new Conn({
         const data = JSON.parse(e.data);
 
         if (data && data._pwf === "-1" && data.event === 4) {
-          console.log(data);
           resolver();
         }
       } catch (error) {}
@@ -743,6 +750,20 @@ function ccWa(event: MouseEvent) {
 
 // Attach the click event listener to the button
 cc.addEventListener("click", ccWa);
+
+const ss: HTMLButtonElement = document.createElement("button");
+ss.textContent = "Start"; // Set the button text
+
+// Add the button to the document body or any other HTML element
+document.body.appendChild(ss);
+
+// Define a click event listener function
+function ssWa(event: MouseEvent) {
+  con.start();
+}
+
+// Attach the click event listener to the button
+ss.addEventListener("click", ssWa);
 
 const dd: HTMLButtonElement = document.createElement("button");
 dd.textContent = "Close"; // Set the button text
